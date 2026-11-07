@@ -1,0 +1,335 @@
+{
+  "name": "1 - Ingesta de correos (Excel y PDF)",
+  "nodes": [
+    {
+      "id": "n1",
+      "name": "Email Trigger (IMAP)",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "mailbox": "INBOX",
+        "postProcessAction": "read",
+        "format": "simple",
+        "downloadAttachments": true,
+        "dataPropertyAttachmentsPrefixName": "attachment_",
+        "options": {
+          "customEmailConfig": "[\"UNSEEN\", [\"FROM\", \"remitente@ejemplo.com\"]]",
+          "forceReconnect": 60
+        }
+      },
+      "credentials": {
+        "imap": {
+          "id": "",
+          "name": "Gmail IMAP"
+        }
+      }
+    },
+    {
+      "id": "n2",
+      "name": "Filtrar remitente y expandir adjuntos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ============================================================================\n// lib.js — helpers compartidos por los Code nodes de n8n.\n// n8n no permite importar archivos locales, así que scripts/build_workflows.js\n// concatena este archivo delante de cada script al generar los workflows.\n// Aquí vive TODA la lógica determinística (parseo, normalización, validación):\n// por eso la IA no se usa para esto (ver docs/DECISIONES.md).\n// ============================================================================\n\n// Catálogo de estados válidos (ajústalo cuando veas los datos reales)\nconst ESTADOS = ['Completado', 'Pendiente', 'Cancelado', 'En proceso', 'Rechazado'];\n\nconst MESES = { enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6, julio: 7,\n  agosto: 8, septiembre: 9, setiembre: 9, octubre: 10, noviembre: 11, diciembre: 12 };\n\n// minúsculas, sin tildes, sin signos: sirve para comparar encabezados y claves\nfunction norm(s) {\n  return String(s ?? '').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')\n    .replace(/[^a-z0-9 ]/g, ' ').replace(/\\s+/g, ' ').trim();\n}\n\nfunction clean(v) {\n  if (v === null || v === undefined) return null;\n  const s = String(v).replace(/\\s+/g, ' ').trim();\n  return s === '' ? null : s;\n}\n\n// Saca la dirección de un \"From\" de IMAP. Soporta:\n//   \"Nombre <mail@x.com>\" | { text: \"...\" } | { value: [{ address: \"...\" }] } | [\"...\"]\nfunction emailAddress(v) {\n  if (v === null || v === undefined) return '';\n  if (Array.isArray(v)) return emailAddress(v[0]);\n  if (typeof v === 'object') {\n    if (Array.isArray(v.value) && v.value.length) {\n      return emailAddress(v.value[0]?.address ?? v.value[0]?.text ?? v.value[0]);\n    }\n    return emailAddress(v.text ?? v.address ?? '');\n  }\n  const s = String(v);\n  const angle = s.match(/<([^>\\s]+@[^>\\s]+)>/);\n  if (angle) return angle[1].trim().toLowerCase();\n  const plain = s.match(/[^\\s<>,;\"]+@[^\\s<>,;\"]+/);\n  return plain ? plain[0].trim().toLowerCase() : '';\n}\n\n// Message-ID real del correo. En el trigger IMAP v2 \"simple\" viene en metadata['message-id'];\n// si el servidor no lo trae, usa el UID de IMAP y, como último recurso, from|date|subject.\nfunction messageIdOf(j) {\n  const meta = j?.metadata ?? {};\n  const metaKey = Object.keys(meta).find((k) => k.toLowerCase() === 'message-id');\n  const id = (metaKey ? meta[metaKey] : null) ?? meta.messageId ?? j?.messageId ?? j?.message_id;\n  if (id) return String(id).trim();\n  const uid = j?.attributes?.uid;\n  if (uid !== undefined && uid !== null) return `imap-uid:${uid}`;\n  return `${emailAddress(j?.from ?? meta.from)}|${j?.date ?? meta.date ?? ''}|${j?.subject ?? meta.subject ?? ''}`;\n}\n\n// \"$12.500.000\" -> 12500000 | \"1.500,50\" -> 1500.5 | \"1,500.50\" -> 1500.5 | 1500 -> 1500\n// Convención: \"1.500\" (punto + 3 dígitos) se lee como miles (estilo colombiano).\nfunction parseNumber(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (typeof v === 'number') return Number.isFinite(v) ? v : null;\n  if (/^-?\\d+(?:\\.\\d+)?e[+-]?\\d+$/i.test(String(v).trim())) {\n    const exp = Number(String(v).trim());\n    return Number.isFinite(exp) ? exp : null;\n  }\n  let s = String(v).trim().replace(/[^\\d.,\\-]/g, '');\n  if (!s || s === '-') return null;\n  const hasDot = s.includes('.'), hasComma = s.includes(',');\n  if (hasDot && hasComma) {\n    // el último separador que aparece es el decimal\n    if (s.lastIndexOf(',') > s.lastIndexOf('.')) s = s.replace(/\\./g, '').replace(',', '.');\n    else s = s.replace(/,/g, '');\n  } else if (hasComma) {\n    const p = s.split(',');\n    s = (p.length === 2 && p[1].length !== 3) ? s.replace(',', '.') : s.replace(/,/g, '');\n  } else if (hasDot) {\n    const p = s.split('.');\n    if (p.length > 2 || (p.length === 2 && p[1].length === 3)) s = s.replace(/\\./g, '');\n  }\n  const n = Number(s);\n  return Number.isFinite(n) ? n : null;\n}\n\nfunction iso(y, m, d) {\n  const dt = new Date(Date.UTC(y, m - 1, d));\n  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null;\n  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;\n}\n\n// -> 'YYYY-MM-DD' o null. Acepta ISO, dd/mm/yyyy, \"15 de octubre de 2026\", serial de Excel y Date.\nfunction parseDate(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (v instanceof Date) return isNaN(v) ? null : v.toISOString().slice(0, 10);\n  if (typeof v === 'number') {\n    if (v > 20000 && v < 80000) return new Date(Math.round((v - 25569) * 86400000)).toISOString().slice(0, 10);\n    return null;\n  }\n  const s = String(v).trim();\n  let m;\n  if ((m = s.match(/^(\\d{4})-(\\d{1,2})-(\\d{1,2})/))) return iso(+m[1], +m[2], +m[3]);\n  if ((m = s.match(/^(\\d{1,2})[\\/\\-.](\\d{1,2})[\\/\\-.](\\d{4})$/))) return iso(+m[3], +m[2], +m[1]); // dd/mm/yyyy\n  if ((m = s.toLowerCase().match(/^(\\d{1,2})\\s+de\\s+([a-záéíóú]+)\\s+(?:de\\s+)?(\\d{4})$/))) {\n    const mes = MESES[norm(m[2])];\n    return mes ? iso(+m[3], mes, +m[1]) : null;\n  }\n  return null;\n}\n\n// \"completado \" -> \"Completado\"; si no está en el catálogo se conserva tal cual (y se marca warning)\nfunction canonEstado(v) {\n  const s = clean(v);\n  if (!s) return null;\n  const hit = ESTADOS.find((e) => norm(e) === norm(s));\n  return hit ?? s;\n}\n\nfunction toIsoOrNull(v) {\n  if (!v) return null;\n  const d = new Date(v);\n  return isNaN(d) ? null : d.toISOString();\n}\n\n// Convierte campos crudos (Excel o PDF) al esquema común. NO valida: eso lo hace validateRecord.\nfunction buildRecord(f, meta, sourceType) {\n  return {\n    fecha: parseDate(f.fecha),\n    cliente: clean(f.cliente),\n    referencia: clean(f.referencia),\n    categoria: clean(f.categoria),\n    cantidad: parseNumber(f.cantidad),\n    valor: parseNumber(f.valor),\n    estado: canonEstado(f.estado),\n    source_type: sourceType,\n    source_file: meta.filename ?? null,\n    email_message_id: meta.message_id ?? null,\n    email_received_at: toIsoOrNull(meta.received_at),\n    _raw: { fecha: f.fecha, cantidad: f.cantidad, valor: f.valor, estado: f.estado },\n  };\n}\n\nconst isBlank = (v) => v === null || v === undefined || String(v).trim() === '';\n\n// Reglas determinísticas. error = falta algo obligatorio o es inválido; warning = sospechoso.\nfunction validateRecord(r) {\n  const errors = [], warnings = [];\n  if (!r.fecha) errors.push(isBlank(r._raw.fecha) ? 'Fecha vacía' : `Fecha inválida: \"${r._raw.fecha}\"`);\n  if (!r.cliente) errors.push('Cliente vacío');\n  if (!r.categoria) errors.push('Categoría vacía');\n  if (r.valor === null) errors.push(isBlank(r._raw.valor) ? 'Valor vacío' : `Valor no numérico: \"${r._raw.valor}\"`);\n  else if (r.valor < 0) errors.push('Valor negativo');\n  if (!r.estado) errors.push('Estado vacío');\n  else if (!ESTADOS.includes(r.estado)) warnings.push(`Estado fuera del catálogo: \"${r.estado}\"`);\n  if (r.cantidad !== null && (r.cantidad <= 0 || !Number.isInteger(r.cantidad))) warnings.push(`Cantidad sospechosa: ${r.cantidad}`);\n  if (r.cantidad === null && !isBlank(r._raw.cantidad)) warnings.push(`Cantidad no numérica: \"${r._raw.cantidad}\"`);\n  if (r.fecha && new Date(r.fecha) > new Date(Date.now() + 86400000)) warnings.push('Fecha en el futuro');\n  const flag = errors.length ? 'error' : warnings.length ? 'warning' : 'ok';\n  return { flag, note: [...errors, ...warnings].join('; ') || null };\n}\n\n// Clave de deduplicación por CONTENIDO: mismo registro (mismos campos normalizados) => misma clave.\n// Incluye `referencia` (solo PDF) y `cantidad` (solo Excel), que son específicos de cada origen:\n// reenviar el mismo Excel o el mismo PDF no duplica, pero un registro idéntico que llegue a la vez\n// en Excel y en PDF puede no colapsar (ver README > Limitaciones).\nfunction rowKey(r) {\n  return [r.fecha, r.cliente, r.referencia, r.categoria, r.cantidad, r.valor, r.estado]\n    .map((x) => norm(x ?? '')).join('|');\n}\n\n// Fila lista para insertar en la tabla `records` de Supabase\nfunction toDbRow(r) {\n  const { flag, note } = validateRecord(r);\n  const { _raw, _extract_error, ...rest } = r;\n  // row_key/quality_* van al final para que un campo homónimo de entrada no los pise.\n  return { ...rest, row_key: rowKey(r), quality_flag: flag, quality_note: note };\n}\n\n\n// Nodo: \"Filtrar remitente y expandir adjuntos\"  (modo: Run Once for All Items)\n// 1) Valida que el correo venga EXACTAMENTE del remitente autorizado\n// 2) emite 1 item por adjunto .pdf/.xlsx\n// OJO: n8n Cloud no tiene variables de entorno; cambia ALLOWED_SENDER aquí Y en el\n// filtro FROM del trigger IMAP (Options -> Custom Email Rules).\nconst ALLOWED_SENDER = 'remitente@ejemplo.com'.trim().toLowerCase(); // <-- CAMBIAR por el remitente real\nconst ALLOWED_EXT = ['pdf', 'xlsx'];\n\n// Si el adjunto no trae extensión, se deduce por MIME type.\nconst MIME_EXT = [\n  ['pdf', /pdf/i],\n  ['xlsx', /(spreadsheetml|ms-excel|excel)/i],\n];\n\nfunction extOf(bin, filename) {\n  const dot = filename.lastIndexOf('.');\n  const byName = dot > 0 ? filename.slice(dot + 1).toLowerCase() : '';\n  if (ALLOWED_EXT.includes(byName)) return byName;\n  if (byName) return ''; // extensión explícita no soportada (p. ej. .exe)\n  const mime = String(bin?.mimeType ?? '');\n  for (const [ext, re] of MIME_EXT) if (re.test(mime)) return ext;\n  return '';\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json ?? {};\n\n  // Comparación EXACTA de la dirección: \"xremitente@ejemplo.com\" o\n  // \"remitente@ejemplo.com.evil.com\" NO pasan. n8n IMAP v2 entrega `from` como\n  // string (\"Nombre <mail@x.com>\"), pero se soportan también objetos/arrays.\n  const from = emailAddress(j.from ?? j.metadata?.from);\n  if (from !== ALLOWED_SENDER.toLowerCase()) continue;\n\n  const messageId = messageIdOf(j);\n  const subject = j.subject ?? j.metadata?.subject ?? null;\n  const receivedAt = j.date ?? j.metadata?.date ?? null;\n\n  for (const [key, bin] of Object.entries(item.binary ?? {})) {\n    const rawName = bin?.fileName || key;\n    const filename = String(rawName).trim().split(/[\\\\/]/).pop() || key;\n    const ext = extOf(bin, filename);\n    if (!ext) continue; // ignora imágenes de firma, etc.\n    out.push({\n      json: {\n        message_id: messageId,\n        sender: from,\n        subject,\n        received_at: receivedAt,\n        filename,\n        ext,\n        source_type: ext === 'pdf' ? 'pdf' : 'excel',\n      },\n      binary: { data: bin },\n    });\n  }\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "n3",
+      "name": "Registrar archivo recibido",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://ufrxxzrbakoaiqzzocds.supabase.co/rest/v1/processed_files?on_conflict=message_id,filename",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpCustomAuth",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "resolution=ignore-duplicates,return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ message_id: $json.message_id, filename: $json.filename, source_type: $json.source_type, sender: $json.sender, subject: $json.subject }) }}"
+      },
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "",
+          "name": "Supabase service key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "n4",
+      "name": "¿Es Excel?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        520,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.ext }}",
+              "rightValue": "xlsx",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "n5",
+      "name": "Leer Excel",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        780,
+        220
+      ],
+      "parameters": {
+        "operation": "xlsx",
+        "binaryPropertyName": "data",
+        "options": {}
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "n6",
+      "name": "Leer PDF",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        780,
+        400
+      ],
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "data",
+        "options": {}
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "n7",
+      "name": "Normalizar Excel",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ============================================================================\n// lib.js — helpers compartidos por los Code nodes de n8n.\n// n8n no permite importar archivos locales, así que scripts/build_workflows.js\n// concatena este archivo delante de cada script al generar los workflows.\n// Aquí vive TODA la lógica determinística (parseo, normalización, validación):\n// por eso la IA no se usa para esto (ver docs/DECISIONES.md).\n// ============================================================================\n\n// Catálogo de estados válidos (ajústalo cuando veas los datos reales)\nconst ESTADOS = ['Completado', 'Pendiente', 'Cancelado', 'En proceso', 'Rechazado'];\n\nconst MESES = { enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6, julio: 7,\n  agosto: 8, septiembre: 9, setiembre: 9, octubre: 10, noviembre: 11, diciembre: 12 };\n\n// minúsculas, sin tildes, sin signos: sirve para comparar encabezados y claves\nfunction norm(s) {\n  return String(s ?? '').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')\n    .replace(/[^a-z0-9 ]/g, ' ').replace(/\\s+/g, ' ').trim();\n}\n\nfunction clean(v) {\n  if (v === null || v === undefined) return null;\n  const s = String(v).replace(/\\s+/g, ' ').trim();\n  return s === '' ? null : s;\n}\n\n// Saca la dirección de un \"From\" de IMAP. Soporta:\n//   \"Nombre <mail@x.com>\" | { text: \"...\" } | { value: [{ address: \"...\" }] } | [\"...\"]\nfunction emailAddress(v) {\n  if (v === null || v === undefined) return '';\n  if (Array.isArray(v)) return emailAddress(v[0]);\n  if (typeof v === 'object') {\n    if (Array.isArray(v.value) && v.value.length) {\n      return emailAddress(v.value[0]?.address ?? v.value[0]?.text ?? v.value[0]);\n    }\n    return emailAddress(v.text ?? v.address ?? '');\n  }\n  const s = String(v);\n  const angle = s.match(/<([^>\\s]+@[^>\\s]+)>/);\n  if (angle) return angle[1].trim().toLowerCase();\n  const plain = s.match(/[^\\s<>,;\"]+@[^\\s<>,;\"]+/);\n  return plain ? plain[0].trim().toLowerCase() : '';\n}\n\n// Message-ID real del correo. En el trigger IMAP v2 \"simple\" viene en metadata['message-id'];\n// si el servidor no lo trae, usa el UID de IMAP y, como último recurso, from|date|subject.\nfunction messageIdOf(j) {\n  const meta = j?.metadata ?? {};\n  const metaKey = Object.keys(meta).find((k) => k.toLowerCase() === 'message-id');\n  const id = (metaKey ? meta[metaKey] : null) ?? meta.messageId ?? j?.messageId ?? j?.message_id;\n  if (id) return String(id).trim();\n  const uid = j?.attributes?.uid;\n  if (uid !== undefined && uid !== null) return `imap-uid:${uid}`;\n  return `${emailAddress(j?.from ?? meta.from)}|${j?.date ?? meta.date ?? ''}|${j?.subject ?? meta.subject ?? ''}`;\n}\n\n// \"$12.500.000\" -> 12500000 | \"1.500,50\" -> 1500.5 | \"1,500.50\" -> 1500.5 | 1500 -> 1500\n// Convención: \"1.500\" (punto + 3 dígitos) se lee como miles (estilo colombiano).\nfunction parseNumber(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (typeof v === 'number') return Number.isFinite(v) ? v : null;\n  if (/^-?\\d+(?:\\.\\d+)?e[+-]?\\d+$/i.test(String(v).trim())) {\n    const exp = Number(String(v).trim());\n    return Number.isFinite(exp) ? exp : null;\n  }\n  let s = String(v).trim().replace(/[^\\d.,\\-]/g, '');\n  if (!s || s === '-') return null;\n  const hasDot = s.includes('.'), hasComma = s.includes(',');\n  if (hasDot && hasComma) {\n    // el último separador que aparece es el decimal\n    if (s.lastIndexOf(',') > s.lastIndexOf('.')) s = s.replace(/\\./g, '').replace(',', '.');\n    else s = s.replace(/,/g, '');\n  } else if (hasComma) {\n    const p = s.split(',');\n    s = (p.length === 2 && p[1].length !== 3) ? s.replace(',', '.') : s.replace(/,/g, '');\n  } else if (hasDot) {\n    const p = s.split('.');\n    if (p.length > 2 || (p.length === 2 && p[1].length === 3)) s = s.replace(/\\./g, '');\n  }\n  const n = Number(s);\n  return Number.isFinite(n) ? n : null;\n}\n\nfunction iso(y, m, d) {\n  const dt = new Date(Date.UTC(y, m - 1, d));\n  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null;\n  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;\n}\n\n// -> 'YYYY-MM-DD' o null. Acepta ISO, dd/mm/yyyy, \"15 de octubre de 2026\", serial de Excel y Date.\nfunction parseDate(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (v instanceof Date) return isNaN(v) ? null : v.toISOString().slice(0, 10);\n  if (typeof v === 'number') {\n    if (v > 20000 && v < 80000) return new Date(Math.round((v - 25569) * 86400000)).toISOString().slice(0, 10);\n    return null;\n  }\n  const s = String(v).trim();\n  let m;\n  if ((m = s.match(/^(\\d{4})-(\\d{1,2})-(\\d{1,2})/))) return iso(+m[1], +m[2], +m[3]);\n  if ((m = s.match(/^(\\d{1,2})[\\/\\-.](\\d{1,2})[\\/\\-.](\\d{4})$/))) return iso(+m[3], +m[2], +m[1]); // dd/mm/yyyy\n  if ((m = s.toLowerCase().match(/^(\\d{1,2})\\s+de\\s+([a-záéíóú]+)\\s+(?:de\\s+)?(\\d{4})$/))) {\n    const mes = MESES[norm(m[2])];\n    return mes ? iso(+m[3], mes, +m[1]) : null;\n  }\n  return null;\n}\n\n// \"completado \" -> \"Completado\"; si no está en el catálogo se conserva tal cual (y se marca warning)\nfunction canonEstado(v) {\n  const s = clean(v);\n  if (!s) return null;\n  const hit = ESTADOS.find((e) => norm(e) === norm(s));\n  return hit ?? s;\n}\n\nfunction toIsoOrNull(v) {\n  if (!v) return null;\n  const d = new Date(v);\n  return isNaN(d) ? null : d.toISOString();\n}\n\n// Convierte campos crudos (Excel o PDF) al esquema común. NO valida: eso lo hace validateRecord.\nfunction buildRecord(f, meta, sourceType) {\n  return {\n    fecha: parseDate(f.fecha),\n    cliente: clean(f.cliente),\n    referencia: clean(f.referencia),\n    categoria: clean(f.categoria),\n    cantidad: parseNumber(f.cantidad),\n    valor: parseNumber(f.valor),\n    estado: canonEstado(f.estado),\n    source_type: sourceType,\n    source_file: meta.filename ?? null,\n    email_message_id: meta.message_id ?? null,\n    email_received_at: toIsoOrNull(meta.received_at),\n    _raw: { fecha: f.fecha, cantidad: f.cantidad, valor: f.valor, estado: f.estado },\n  };\n}\n\nconst isBlank = (v) => v === null || v === undefined || String(v).trim() === '';\n\n// Reglas determinísticas. error = falta algo obligatorio o es inválido; warning = sospechoso.\nfunction validateRecord(r) {\n  const errors = [], warnings = [];\n  if (!r.fecha) errors.push(isBlank(r._raw.fecha) ? 'Fecha vacía' : `Fecha inválida: \"${r._raw.fecha}\"`);\n  if (!r.cliente) errors.push('Cliente vacío');\n  if (!r.categoria) errors.push('Categoría vacía');\n  if (r.valor === null) errors.push(isBlank(r._raw.valor) ? 'Valor vacío' : `Valor no numérico: \"${r._raw.valor}\"`);\n  else if (r.valor < 0) errors.push('Valor negativo');\n  if (!r.estado) errors.push('Estado vacío');\n  else if (!ESTADOS.includes(r.estado)) warnings.push(`Estado fuera del catálogo: \"${r.estado}\"`);\n  if (r.cantidad !== null && (r.cantidad <= 0 || !Number.isInteger(r.cantidad))) warnings.push(`Cantidad sospechosa: ${r.cantidad}`);\n  if (r.cantidad === null && !isBlank(r._raw.cantidad)) warnings.push(`Cantidad no numérica: \"${r._raw.cantidad}\"`);\n  if (r.fecha && new Date(r.fecha) > new Date(Date.now() + 86400000)) warnings.push('Fecha en el futuro');\n  const flag = errors.length ? 'error' : warnings.length ? 'warning' : 'ok';\n  return { flag, note: [...errors, ...warnings].join('; ') || null };\n}\n\n// Clave de deduplicación por CONTENIDO: mismo registro (mismos campos normalizados) => misma clave.\n// Incluye `referencia` (solo PDF) y `cantidad` (solo Excel), que son específicos de cada origen:\n// reenviar el mismo Excel o el mismo PDF no duplica, pero un registro idéntico que llegue a la vez\n// en Excel y en PDF puede no colapsar (ver README > Limitaciones).\nfunction rowKey(r) {\n  return [r.fecha, r.cliente, r.referencia, r.categoria, r.cantidad, r.valor, r.estado]\n    .map((x) => norm(x ?? '')).join('|');\n}\n\n// Fila lista para insertar en la tabla `records` de Supabase\nfunction toDbRow(r) {\n  const { flag, note } = validateRecord(r);\n  const { _raw, _extract_error, ...rest } = r;\n  // row_key/quality_* van al final para que un campo homónimo de entrada no los pise.\n  return { ...rest, row_key: rowKey(r), quality_flag: flag, quality_note: note };\n}\n\n\n// Nodo: \"Normalizar Excel\"  (modo: Run Once for All Items)\n// Entrada: una fila por item (salida de \"Extract from File\" -> xlsx). Salida: registros en esquema común.\nconst META_NODE = 'Filtrar remitente y expandir adjuntos';\n\nconst ALIASES = {\n  fecha: ['fecha', 'fecha operacion', 'fecha de operacion', 'fecha de la operacion',\n    'fecha registro', 'fecha de registro'],\n  cliente: ['cliente', 'nombre cliente', 'nombre del cliente', 'razon social'],\n  referencia: ['referencia', 'numero de referencia', 'numero referencia', 'nro de referencia',\n    'nro referencia', 'no de referencia', 'no referencia', 'n de referencia', 'ref'],\n  categoria: ['categoria', 'tipo', 'servicio'],\n  cantidad: ['cantidad', 'cant', 'unidades'],\n  valor: ['valor', 'monto', 'total', 'valor total', 'importe'],\n  estado: ['estado', 'status', 'situacion'],\n};\n\n// busca la columna por nombre tolerante (mayúsculas, tildes, espacios)\nfunction pick(row, field) {\n  for (const k of Object.keys(row)) if (ALIASES[field].includes(norm(k))) return row[k];\n  return null;\n}\n\n// El meta (message_id, filename...) vive en el nodo \"Filtrar...\". Extract from File\n// propaga `pairedItem`, así que itemMatching(i) lo resuelve. Se deja un fallback por\n// si una versión de n8n no propaga el pairedItem.\nfunction metaFor(it, i) {\n  try {\n    const m = $(META_NODE).itemMatching(i);\n    if (m?.json?.filename) return m.json;\n  } catch (e) { /* usa el fallback */ }\n  const pi = Array.isArray(it?.pairedItem) ? it.pairedItem[0] : it?.pairedItem;\n  const idx = typeof pi === 'number' ? pi : pi?.item;\n  let all = [];\n  try { all = $(META_NODE).all() ?? []; } catch (e) { all = []; }\n  return (typeof idx === 'number' ? all[idx] : all[i])?.json ?? {};\n}\n\nconst out = [];\n$input.all().forEach((it, i) => {\n  const j = it.json ?? {};\n  const meta = metaFor(it, i);\n\n  // Extract from File con onError=continueRegularOutput devuelve { error: \"...\" }.\n  // Si no se controla, la fila desaparece en silencio: se convierte en un error visible.\n  if (j.error && Object.keys(j).length === 1) {\n    const rec = buildRecord({}, meta, 'excel');\n    rec._extract_error = String(j.error);\n    out.push({ json: rec });\n    return;\n  }\n\n  const f = {};\n  for (const field of Object.keys(ALIASES)) f[field] = pick(j, field);\n  const vacia = ['fecha', 'cliente', 'referencia', 'categoria', 'cantidad', 'valor', 'estado']\n    .every((k) => isBlank(f[k]));\n  if (vacia) return; // fila totalmente vacía del Excel\n  out.push({ json: buildRecord(f, meta, 'excel') });\n});\nreturn out;\n"
+      }
+    },
+    {
+      "id": "n8",
+      "name": "Normalizar PDF",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        400
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ============================================================================\n// lib.js — helpers compartidos por los Code nodes de n8n.\n// n8n no permite importar archivos locales, así que scripts/build_workflows.js\n// concatena este archivo delante de cada script al generar los workflows.\n// Aquí vive TODA la lógica determinística (parseo, normalización, validación):\n// por eso la IA no se usa para esto (ver docs/DECISIONES.md).\n// ============================================================================\n\n// Catálogo de estados válidos (ajústalo cuando veas los datos reales)\nconst ESTADOS = ['Completado', 'Pendiente', 'Cancelado', 'En proceso', 'Rechazado'];\n\nconst MESES = { enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6, julio: 7,\n  agosto: 8, septiembre: 9, setiembre: 9, octubre: 10, noviembre: 11, diciembre: 12 };\n\n// minúsculas, sin tildes, sin signos: sirve para comparar encabezados y claves\nfunction norm(s) {\n  return String(s ?? '').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')\n    .replace(/[^a-z0-9 ]/g, ' ').replace(/\\s+/g, ' ').trim();\n}\n\nfunction clean(v) {\n  if (v === null || v === undefined) return null;\n  const s = String(v).replace(/\\s+/g, ' ').trim();\n  return s === '' ? null : s;\n}\n\n// Saca la dirección de un \"From\" de IMAP. Soporta:\n//   \"Nombre <mail@x.com>\" | { text: \"...\" } | { value: [{ address: \"...\" }] } | [\"...\"]\nfunction emailAddress(v) {\n  if (v === null || v === undefined) return '';\n  if (Array.isArray(v)) return emailAddress(v[0]);\n  if (typeof v === 'object') {\n    if (Array.isArray(v.value) && v.value.length) {\n      return emailAddress(v.value[0]?.address ?? v.value[0]?.text ?? v.value[0]);\n    }\n    return emailAddress(v.text ?? v.address ?? '');\n  }\n  const s = String(v);\n  const angle = s.match(/<([^>\\s]+@[^>\\s]+)>/);\n  if (angle) return angle[1].trim().toLowerCase();\n  const plain = s.match(/[^\\s<>,;\"]+@[^\\s<>,;\"]+/);\n  return plain ? plain[0].trim().toLowerCase() : '';\n}\n\n// Message-ID real del correo. En el trigger IMAP v2 \"simple\" viene en metadata['message-id'];\n// si el servidor no lo trae, usa el UID de IMAP y, como último recurso, from|date|subject.\nfunction messageIdOf(j) {\n  const meta = j?.metadata ?? {};\n  const metaKey = Object.keys(meta).find((k) => k.toLowerCase() === 'message-id');\n  const id = (metaKey ? meta[metaKey] : null) ?? meta.messageId ?? j?.messageId ?? j?.message_id;\n  if (id) return String(id).trim();\n  const uid = j?.attributes?.uid;\n  if (uid !== undefined && uid !== null) return `imap-uid:${uid}`;\n  return `${emailAddress(j?.from ?? meta.from)}|${j?.date ?? meta.date ?? ''}|${j?.subject ?? meta.subject ?? ''}`;\n}\n\n// \"$12.500.000\" -> 12500000 | \"1.500,50\" -> 1500.5 | \"1,500.50\" -> 1500.5 | 1500 -> 1500\n// Convención: \"1.500\" (punto + 3 dígitos) se lee como miles (estilo colombiano).\nfunction parseNumber(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (typeof v === 'number') return Number.isFinite(v) ? v : null;\n  if (/^-?\\d+(?:\\.\\d+)?e[+-]?\\d+$/i.test(String(v).trim())) {\n    const exp = Number(String(v).trim());\n    return Number.isFinite(exp) ? exp : null;\n  }\n  let s = String(v).trim().replace(/[^\\d.,\\-]/g, '');\n  if (!s || s === '-') return null;\n  const hasDot = s.includes('.'), hasComma = s.includes(',');\n  if (hasDot && hasComma) {\n    // el último separador que aparece es el decimal\n    if (s.lastIndexOf(',') > s.lastIndexOf('.')) s = s.replace(/\\./g, '').replace(',', '.');\n    else s = s.replace(/,/g, '');\n  } else if (hasComma) {\n    const p = s.split(',');\n    s = (p.length === 2 && p[1].length !== 3) ? s.replace(',', '.') : s.replace(/,/g, '');\n  } else if (hasDot) {\n    const p = s.split('.');\n    if (p.length > 2 || (p.length === 2 && p[1].length === 3)) s = s.replace(/\\./g, '');\n  }\n  const n = Number(s);\n  return Number.isFinite(n) ? n : null;\n}\n\nfunction iso(y, m, d) {\n  const dt = new Date(Date.UTC(y, m - 1, d));\n  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null;\n  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;\n}\n\n// -> 'YYYY-MM-DD' o null. Acepta ISO, dd/mm/yyyy, \"15 de octubre de 2026\", serial de Excel y Date.\nfunction parseDate(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (v instanceof Date) return isNaN(v) ? null : v.toISOString().slice(0, 10);\n  if (typeof v === 'number') {\n    if (v > 20000 && v < 80000) return new Date(Math.round((v - 25569) * 86400000)).toISOString().slice(0, 10);\n    return null;\n  }\n  const s = String(v).trim();\n  let m;\n  if ((m = s.match(/^(\\d{4})-(\\d{1,2})-(\\d{1,2})/))) return iso(+m[1], +m[2], +m[3]);\n  if ((m = s.match(/^(\\d{1,2})[\\/\\-.](\\d{1,2})[\\/\\-.](\\d{4})$/))) return iso(+m[3], +m[2], +m[1]); // dd/mm/yyyy\n  if ((m = s.toLowerCase().match(/^(\\d{1,2})\\s+de\\s+([a-záéíóú]+)\\s+(?:de\\s+)?(\\d{4})$/))) {\n    const mes = MESES[norm(m[2])];\n    return mes ? iso(+m[3], mes, +m[1]) : null;\n  }\n  return null;\n}\n\n// \"completado \" -> \"Completado\"; si no está en el catálogo se conserva tal cual (y se marca warning)\nfunction canonEstado(v) {\n  const s = clean(v);\n  if (!s) return null;\n  const hit = ESTADOS.find((e) => norm(e) === norm(s));\n  return hit ?? s;\n}\n\nfunction toIsoOrNull(v) {\n  if (!v) return null;\n  const d = new Date(v);\n  return isNaN(d) ? null : d.toISOString();\n}\n\n// Convierte campos crudos (Excel o PDF) al esquema común. NO valida: eso lo hace validateRecord.\nfunction buildRecord(f, meta, sourceType) {\n  return {\n    fecha: parseDate(f.fecha),\n    cliente: clean(f.cliente),\n    referencia: clean(f.referencia),\n    categoria: clean(f.categoria),\n    cantidad: parseNumber(f.cantidad),\n    valor: parseNumber(f.valor),\n    estado: canonEstado(f.estado),\n    source_type: sourceType,\n    source_file: meta.filename ?? null,\n    email_message_id: meta.message_id ?? null,\n    email_received_at: toIsoOrNull(meta.received_at),\n    _raw: { fecha: f.fecha, cantidad: f.cantidad, valor: f.valor, estado: f.estado },\n  };\n}\n\nconst isBlank = (v) => v === null || v === undefined || String(v).trim() === '';\n\n// Reglas determinísticas. error = falta algo obligatorio o es inválido; warning = sospechoso.\nfunction validateRecord(r) {\n  const errors = [], warnings = [];\n  if (!r.fecha) errors.push(isBlank(r._raw.fecha) ? 'Fecha vacía' : `Fecha inválida: \"${r._raw.fecha}\"`);\n  if (!r.cliente) errors.push('Cliente vacío');\n  if (!r.categoria) errors.push('Categoría vacía');\n  if (r.valor === null) errors.push(isBlank(r._raw.valor) ? 'Valor vacío' : `Valor no numérico: \"${r._raw.valor}\"`);\n  else if (r.valor < 0) errors.push('Valor negativo');\n  if (!r.estado) errors.push('Estado vacío');\n  else if (!ESTADOS.includes(r.estado)) warnings.push(`Estado fuera del catálogo: \"${r.estado}\"`);\n  if (r.cantidad !== null && (r.cantidad <= 0 || !Number.isInteger(r.cantidad))) warnings.push(`Cantidad sospechosa: ${r.cantidad}`);\n  if (r.cantidad === null && !isBlank(r._raw.cantidad)) warnings.push(`Cantidad no numérica: \"${r._raw.cantidad}\"`);\n  if (r.fecha && new Date(r.fecha) > new Date(Date.now() + 86400000)) warnings.push('Fecha en el futuro');\n  const flag = errors.length ? 'error' : warnings.length ? 'warning' : 'ok';\n  return { flag, note: [...errors, ...warnings].join('; ') || null };\n}\n\n// Clave de deduplicación por CONTENIDO: mismo registro (mismos campos normalizados) => misma clave.\n// Incluye `referencia` (solo PDF) y `cantidad` (solo Excel), que son específicos de cada origen:\n// reenviar el mismo Excel o el mismo PDF no duplica, pero un registro idéntico que llegue a la vez\n// en Excel y en PDF puede no colapsar (ver README > Limitaciones).\nfunction rowKey(r) {\n  return [r.fecha, r.cliente, r.referencia, r.categoria, r.cantidad, r.valor, r.estado]\n    .map((x) => norm(x ?? '')).join('|');\n}\n\n// Fila lista para insertar en la tabla `records` de Supabase\nfunction toDbRow(r) {\n  const { flag, note } = validateRecord(r);\n  const { _raw, _extract_error, ...rest } = r;\n  // row_key/quality_* van al final para que un campo homónimo de entrada no los pise.\n  return { ...rest, row_key: rowKey(r), quality_flag: flag, quality_note: note };\n}\n\n\n// Nodo: \"Normalizar PDF\"  (modo: Run Once for All Items)\n// Entrada: salida de \"Extract from File\" -> pdf (campo `text`). Salida: registros en esquema común.\n// Soporta (A) bloques \"Etiqueta: valor\" (uno o varios registros) (B) filas de tabla separadas por tabs/2+ espacios y (C) filas con espacios simples.\n// >>> AJUSTA este parser cuando veas el PDF real: es la única parte que depende de su diseño. <<<\nconst META_NODE = 'Filtrar remitente y expandir adjuntos';\n\nconst LABELS = {\n  fecha: ['fecha'],\n  cliente: ['cliente', 'nombre del cliente', 'razon social'],\n  referencia: ['numero de referencia', 'numero referencia', 'n de referencia', 'no de referencia',\n    'nro de referencia', 'referencia', 'ref'],\n  categoria: ['categoria', 'tipo', 'servicio'],\n  valor: ['valor', 'monto', 'total', 'valor total', 'importe'],\n  estado: ['estado', 'status', 'situacion'],\n};\nfunction fieldOf(label) {\n  const l = norm(label);\n  return Object.keys(LABELS).find((f) => LABELS[f].includes(l)) ?? null;\n}\n\nfunction parsePdfText(text) {\n  const lines = String(text ?? '').split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);\n\n  // (A) bloques \"Etiqueta: valor\"; una nueva \"Fecha\" abre un registro nuevo\n  const blocks = [];\n  let cur = null;\n  for (const line of lines) {\n    const idx = line.indexOf(':');\n    if (idx < 0) continue;\n    const label = line.slice(0, idx);\n    const field = fieldOf(label);\n    if (!field) continue;\n    const value = line.slice(idx + 1).trim();\n    // Un \"Total:\" de pie de página no debe pisar el valor del registro en curso.\n    if (field === 'valor' && ['total', 'valor total'].includes(norm(label)) && cur?.valor !== undefined) continue;\n    if (field === 'fecha' && cur && cur.fecha !== undefined) { blocks.push(cur); cur = null; }\n    if (!cur) cur = {};\n    cur[field] = value;\n  }\n  if (cur) blocks.push(cur);\n  const good = blocks.filter((b) => Object.keys(b).length >= 3);\n  if (good.length) return good;\n\n  // (B) filas de tabla: Fecha | Cliente | Referencia | Categoría | Valor | Estado\n  const rows = [];\n  for (const line of lines) {\n    const t = line.split(/\\t|\\s{2,}/).map((x) => x.trim()).filter(Boolean);\n    if (t.length === 6 && parseDate(t[0])) {\n      rows.push({ fecha: t[0], cliente: t[1], referencia: t[2], categoria: t[3], valor: t[4], estado: t[5] });\n    }\n  }\n  if (rows.length) return rows;\n\n  // (C) filas con espacios simples: \"2026-10-15 Cliente A REF-0001 Servicio A $1.500.000 Completado\"\n  // Heurística: fecha al inicio, estado (del catálogo) al final, valor justo antes, y la referencia\n  // (letras+dígitos o 3+ dígitos) separa cliente (antes) de categoría (después).\n  for (const line of lines) {\n    const t = line.split(/\\s+/);\n    if (t.length < 6 || !parseDate(t[0])) continue;\n    const estado = ESTADOS.find((e) => norm(t.slice(-e.split(' ').length).join(' ')) === norm(e));\n    if (!estado) continue;\n    const end = t.length - estado.split(' ').length;\n    const valor = t[end - 1];\n    if (!/^[$\\d.,\\-]+$/.test(valor)) continue;\n    const mid = t.slice(1, end - 1);\n    const ri = mid.findIndex((x) => /^([A-Za-z]{1,6}[-_]?\\d{2,}|\\d{3,})$/.test(x));\n    if (ri < 1 || ri === mid.length - 1) continue;\n    rows.push({ fecha: t[0], cliente: mid.slice(0, ri).join(' '), referencia: mid[ri],\n      categoria: mid.slice(ri + 1).join(' '), valor, estado });\n  }\n  return rows;\n}\n\n// Ver 02_normalizar_excel.js: itemMatching + fallback por pairedItem/índice.\nfunction metaFor(it, i) {\n  try {\n    const m = $(META_NODE).itemMatching(i);\n    if (m?.json?.filename) return m.json;\n  } catch (e) { /* usa el fallback */ }\n  const pi = Array.isArray(it?.pairedItem) ? it.pairedItem[0] : it?.pairedItem;\n  const idx = typeof pi === 'number' ? pi : pi?.item;\n  let all = [];\n  try { all = $(META_NODE).all() ?? []; } catch (e) { all = []; }\n  const fromMeta = (typeof idx === 'number' ? all[idx] : all[i])?.json;\n  if (fromMeta?.filename) return fromMeta;\n  // Extract from File (PDF) conserva el JSON de entrada por defecto (keepSource=json).\n  return it?.json ?? {};\n}\n\nconst out = [];\n$input.all().forEach((it, i) => {\n  const j = it.json ?? {};\n  const meta = metaFor(it, i);\n\n  // Extract from File con onError=continueRegularOutput devuelve { error: \"...\" }.\n  if (j.error && Object.keys(j).length === 1) {\n    const rec = buildRecord({}, meta, 'pdf');\n    rec._extract_error = String(j.error);\n    out.push({ json: rec });\n    return;\n  }\n\n  const found = parsePdfText(j.text);\n  if (!found.length) {\n    // Documento ilegible: se guarda una fila marcada como error para que sea visible en el dashboard\n    const rec = buildRecord({ fecha: null, cliente: null, categoria: null, valor: null, estado: null }, meta, 'pdf');\n    out.push({ json: rec });\n    return;\n  }\n  for (const f of found) out.push({ json: buildRecord(f, meta, 'pdf') });\n});\nreturn out;\n"
+      }
+    },
+    {
+      "id": "n9",
+      "name": "Validar y preparar fila",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ============================================================================\n// lib.js — helpers compartidos por los Code nodes de n8n.\n// n8n no permite importar archivos locales, así que scripts/build_workflows.js\n// concatena este archivo delante de cada script al generar los workflows.\n// Aquí vive TODA la lógica determinística (parseo, normalización, validación):\n// por eso la IA no se usa para esto (ver docs/DECISIONES.md).\n// ============================================================================\n\n// Catálogo de estados válidos (ajústalo cuando veas los datos reales)\nconst ESTADOS = ['Completado', 'Pendiente', 'Cancelado', 'En proceso', 'Rechazado'];\n\nconst MESES = { enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6, julio: 7,\n  agosto: 8, septiembre: 9, setiembre: 9, octubre: 10, noviembre: 11, diciembre: 12 };\n\n// minúsculas, sin tildes, sin signos: sirve para comparar encabezados y claves\nfunction norm(s) {\n  return String(s ?? '').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')\n    .replace(/[^a-z0-9 ]/g, ' ').replace(/\\s+/g, ' ').trim();\n}\n\nfunction clean(v) {\n  if (v === null || v === undefined) return null;\n  const s = String(v).replace(/\\s+/g, ' ').trim();\n  return s === '' ? null : s;\n}\n\n// Saca la dirección de un \"From\" de IMAP. Soporta:\n//   \"Nombre <mail@x.com>\" | { text: \"...\" } | { value: [{ address: \"...\" }] } | [\"...\"]\nfunction emailAddress(v) {\n  if (v === null || v === undefined) return '';\n  if (Array.isArray(v)) return emailAddress(v[0]);\n  if (typeof v === 'object') {\n    if (Array.isArray(v.value) && v.value.length) {\n      return emailAddress(v.value[0]?.address ?? v.value[0]?.text ?? v.value[0]);\n    }\n    return emailAddress(v.text ?? v.address ?? '');\n  }\n  const s = String(v);\n  const angle = s.match(/<([^>\\s]+@[^>\\s]+)>/);\n  if (angle) return angle[1].trim().toLowerCase();\n  const plain = s.match(/[^\\s<>,;\"]+@[^\\s<>,;\"]+/);\n  return plain ? plain[0].trim().toLowerCase() : '';\n}\n\n// Message-ID real del correo. En el trigger IMAP v2 \"simple\" viene en metadata['message-id'];\n// si el servidor no lo trae, usa el UID de IMAP y, como último recurso, from|date|subject.\nfunction messageIdOf(j) {\n  const meta = j?.metadata ?? {};\n  const metaKey = Object.keys(meta).find((k) => k.toLowerCase() === 'message-id');\n  const id = (metaKey ? meta[metaKey] : null) ?? meta.messageId ?? j?.messageId ?? j?.message_id;\n  if (id) return String(id).trim();\n  const uid = j?.attributes?.uid;\n  if (uid !== undefined && uid !== null) return `imap-uid:${uid}`;\n  return `${emailAddress(j?.from ?? meta.from)}|${j?.date ?? meta.date ?? ''}|${j?.subject ?? meta.subject ?? ''}`;\n}\n\n// \"$12.500.000\" -> 12500000 | \"1.500,50\" -> 1500.5 | \"1,500.50\" -> 1500.5 | 1500 -> 1500\n// Convención: \"1.500\" (punto + 3 dígitos) se lee como miles (estilo colombiano).\nfunction parseNumber(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (typeof v === 'number') return Number.isFinite(v) ? v : null;\n  if (/^-?\\d+(?:\\.\\d+)?e[+-]?\\d+$/i.test(String(v).trim())) {\n    const exp = Number(String(v).trim());\n    return Number.isFinite(exp) ? exp : null;\n  }\n  let s = String(v).trim().replace(/[^\\d.,\\-]/g, '');\n  if (!s || s === '-') return null;\n  const hasDot = s.includes('.'), hasComma = s.includes(',');\n  if (hasDot && hasComma) {\n    // el último separador que aparece es el decimal\n    if (s.lastIndexOf(',') > s.lastIndexOf('.')) s = s.replace(/\\./g, '').replace(',', '.');\n    else s = s.replace(/,/g, '');\n  } else if (hasComma) {\n    const p = s.split(',');\n    s = (p.length === 2 && p[1].length !== 3) ? s.replace(',', '.') : s.replace(/,/g, '');\n  } else if (hasDot) {\n    const p = s.split('.');\n    if (p.length > 2 || (p.length === 2 && p[1].length === 3)) s = s.replace(/\\./g, '');\n  }\n  const n = Number(s);\n  return Number.isFinite(n) ? n : null;\n}\n\nfunction iso(y, m, d) {\n  const dt = new Date(Date.UTC(y, m - 1, d));\n  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null;\n  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;\n}\n\n// -> 'YYYY-MM-DD' o null. Acepta ISO, dd/mm/yyyy, \"15 de octubre de 2026\", serial de Excel y Date.\nfunction parseDate(v) {\n  if (v === null || v === undefined || v === '') return null;\n  if (v instanceof Date) return isNaN(v) ? null : v.toISOString().slice(0, 10);\n  if (typeof v === 'number') {\n    if (v > 20000 && v < 80000) return new Date(Math.round((v - 25569) * 86400000)).toISOString().slice(0, 10);\n    return null;\n  }\n  const s = String(v).trim();\n  let m;\n  if ((m = s.match(/^(\\d{4})-(\\d{1,2})-(\\d{1,2})/))) return iso(+m[1], +m[2], +m[3]);\n  if ((m = s.match(/^(\\d{1,2})[\\/\\-.](\\d{1,2})[\\/\\-.](\\d{4})$/))) return iso(+m[3], +m[2], +m[1]); // dd/mm/yyyy\n  if ((m = s.toLowerCase().match(/^(\\d{1,2})\\s+de\\s+([a-záéíóú]+)\\s+(?:de\\s+)?(\\d{4})$/))) {\n    const mes = MESES[norm(m[2])];\n    return mes ? iso(+m[3], mes, +m[1]) : null;\n  }\n  return null;\n}\n\n// \"completado \" -> \"Completado\"; si no está en el catálogo se conserva tal cual (y se marca warning)\nfunction canonEstado(v) {\n  const s = clean(v);\n  if (!s) return null;\n  const hit = ESTADOS.find((e) => norm(e) === norm(s));\n  return hit ?? s;\n}\n\nfunction toIsoOrNull(v) {\n  if (!v) return null;\n  const d = new Date(v);\n  return isNaN(d) ? null : d.toISOString();\n}\n\n// Convierte campos crudos (Excel o PDF) al esquema común. NO valida: eso lo hace validateRecord.\nfunction buildRecord(f, meta, sourceType) {\n  return {\n    fecha: parseDate(f.fecha),\n    cliente: clean(f.cliente),\n    referencia: clean(f.referencia),\n    categoria: clean(f.categoria),\n    cantidad: parseNumber(f.cantidad),\n    valor: parseNumber(f.valor),\n    estado: canonEstado(f.estado),\n    source_type: sourceType,\n    source_file: meta.filename ?? null,\n    email_message_id: meta.message_id ?? null,\n    email_received_at: toIsoOrNull(meta.received_at),\n    _raw: { fecha: f.fecha, cantidad: f.cantidad, valor: f.valor, estado: f.estado },\n  };\n}\n\nconst isBlank = (v) => v === null || v === undefined || String(v).trim() === '';\n\n// Reglas determinísticas. error = falta algo obligatorio o es inválido; warning = sospechoso.\nfunction validateRecord(r) {\n  const errors = [], warnings = [];\n  if (!r.fecha) errors.push(isBlank(r._raw.fecha) ? 'Fecha vacía' : `Fecha inválida: \"${r._raw.fecha}\"`);\n  if (!r.cliente) errors.push('Cliente vacío');\n  if (!r.categoria) errors.push('Categoría vacía');\n  if (r.valor === null) errors.push(isBlank(r._raw.valor) ? 'Valor vacío' : `Valor no numérico: \"${r._raw.valor}\"`);\n  else if (r.valor < 0) errors.push('Valor negativo');\n  if (!r.estado) errors.push('Estado vacío');\n  else if (!ESTADOS.includes(r.estado)) warnings.push(`Estado fuera del catálogo: \"${r.estado}\"`);\n  if (r.cantidad !== null && (r.cantidad <= 0 || !Number.isInteger(r.cantidad))) warnings.push(`Cantidad sospechosa: ${r.cantidad}`);\n  if (r.cantidad === null && !isBlank(r._raw.cantidad)) warnings.push(`Cantidad no numérica: \"${r._raw.cantidad}\"`);\n  if (r.fecha && new Date(r.fecha) > new Date(Date.now() + 86400000)) warnings.push('Fecha en el futuro');\n  const flag = errors.length ? 'error' : warnings.length ? 'warning' : 'ok';\n  return { flag, note: [...errors, ...warnings].join('; ') || null };\n}\n\n// Clave de deduplicación por CONTENIDO: mismo registro (mismos campos normalizados) => misma clave.\n// Incluye `referencia` (solo PDF) y `cantidad` (solo Excel), que son específicos de cada origen:\n// reenviar el mismo Excel o el mismo PDF no duplica, pero un registro idéntico que llegue a la vez\n// en Excel y en PDF puede no colapsar (ver README > Limitaciones).\nfunction rowKey(r) {\n  return [r.fecha, r.cliente, r.referencia, r.categoria, r.cantidad, r.valor, r.estado]\n    .map((x) => norm(x ?? '')).join('|');\n}\n\n// Fila lista para insertar en la tabla `records` de Supabase\nfunction toDbRow(r) {\n  const { flag, note } = validateRecord(r);\n  const { _raw, _extract_error, ...rest } = r;\n  // row_key/quality_* van al final para que un campo homónimo de entrada no los pise.\n  return { ...rest, row_key: rowKey(r), quality_flag: flag, quality_note: note };\n}\n\n\n// Nodo: \"Validar y preparar fila\"  (modo: Run Once for All Items)\n// Aplica reglas de calidad, calcula row_key (anti-duplicados) y deja la fila lista para la BD.\n// Un registro con errores NO se descarta: se guarda con quality_flag = 'error' para que sea visible.\nconst out = [];\nfor (const it of $input.all()) {\n  const src = it.json ?? {};\n  const row = toDbRow(src);\n\n  // Fila totalmente vacía = archivo ilegible (PDF sin texto o Excel que Extract from File\n  // no pudo abrir). Se usa una clave estable por mensaje+archivo para que reprocesar no\n  // cree una fila nueva y para que cada archivo tenga su propia fila de error.\n  const vacia = !row.fecha && !row.cliente && !row.referencia && !row.categoria\n    && row.cantidad === null && row.valor === null && !row.estado;\n  if (vacia) {\n    row.row_key = `${row.source_type}-ilegible|${row.email_message_id}|${row.source_file}`;\n    row.quality_note = src._extract_error\n      ? `No se pudo leer el archivo: ${src._extract_error}`\n      : (row.source_type === 'pdf' ? 'PDF sin campos reconocibles' : 'Archivo sin campos reconocibles');\n  } else if (src._extract_error) {\n    row.quality_note = [row.quality_note, `Error de extracción: ${src._extract_error}`]\n      .filter(Boolean).join('; ');\n  }\n\n  out.push({ json: row });\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "n10",
+      "name": "Guardar en Supabase",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1560,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://ufrxxzrbakoaiqzzocds.supabase.co/rest/v1/records?on_conflict=row_key",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpCustomAuth",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "resolution=ignore-duplicates,return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}"
+      },
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "",
+          "name": "Supabase service key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 10000
+    }
+  ],
+  "connections": {
+    "Email Trigger (IMAP)": {
+      "main": [
+        [
+          {
+            "node": "Filtrar remitente y expandir adjuntos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filtrar remitente y expandir adjuntos": {
+      "main": [
+        [
+          {
+            "node": "Registrar archivo recibido",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "¿Es Excel?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Es Excel?": {
+      "main": [
+        [
+          {
+            "node": "Leer Excel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Leer PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer Excel": {
+      "main": [
+        [
+          {
+            "node": "Normalizar Excel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer PDF": {
+      "main": [
+        [
+          {
+            "node": "Normalizar PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizar Excel": {
+      "main": [
+        [
+          {
+            "node": "Validar y preparar fila",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizar PDF": {
+      "main": [
+        [
+          {
+            "node": "Validar y preparar fila",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar y preparar fila": {
+      "main": [
+        [
+          {
+            "node": "Guardar en Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

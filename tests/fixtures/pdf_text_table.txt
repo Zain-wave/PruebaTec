@@ -1,0 +1,4 @@
+Reporte semanal
+Fecha Cliente Número de referencia Categoría Valor Estado
+2026-10-15 Cliente A REF-0001 Servicio A $1.500.000 Completado
+2026-10-16 Logística Norte REF-0002 Servicio B $2.750.000 En proceso

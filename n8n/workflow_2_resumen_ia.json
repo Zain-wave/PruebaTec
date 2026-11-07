@@ -1,0 +1,301 @@
+{
+  "name": "2 - Resumen e inconsistencias con IA",
+  "nodes": [
+    {
+      "id": "r1",
+      "name": "Programado (diario)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "r2",
+      "name": "Ejecutar manualmente",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        400
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "r3",
+      "name": "Leer registros",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        300
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://ufrxxzrbakoaiqzzocds.supabase.co/rest/v1/records?select=row_key,fecha,cliente,categoria,valor,estado,quality_flag&order=fecha.desc&limit=5000",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpCustomAuth",
+        "options": {}
+      },
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "",
+          "name": "Supabase service key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "r4",
+      "name": "Preparar prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Nodo: \"Preparar prompt\" — calcula las métricas con CÓDIGO (no con IA) y arma el prompt.\nconst input = $input.all();\nlet rows = input.map((i) => i.json);\n// El nodo HTTP puede devolver un array en un solo item o un item por fila: se soportan ambos.\nif (rows.length === 1 && Array.isArray(rows[0])) rows = rows[0];\n// Un HTTP vacío con alwaysOutputData llega como [{}]: no es un registro real.\nrows = rows.filter((r) => r && typeof r === 'object' && Object.keys(r).length > 0);\n\nconst total = rows.length;\nconst num = (v) => {\n  if (v === null || v === undefined || v === '') return null;\n  const n = Number(v);\n  return Number.isFinite(n) ? n : null;\n};\nconst valorTotal = rows.reduce((s, r) => s + (num(r.valor) ?? 0), 0);\nconst incompletos = rows.filter((r) => r.quality_flag !== 'ok').length;\nconst countBy = (k) => rows.reduce((m, r) => { const x = r[k] ?? 'Sin dato'; m[x] = (m[x] || 0) + 1; return m; }, {});\nconst pct = (m) => Object.fromEntries(Object.entries(m).map(([k, v]) => [k, `${v} (${Math.round(v * 100 / Math.max(total, 1))}%)`]));\nconst fechas = rows.map((r) => r.fecha).filter(Boolean).sort();\nconst fmt = (n) => '$' + Math.round(Number.isFinite(n) ? n : 0).toLocaleString('es-CO');\nconst metrics = {\n  total, valorTotal, valorTotalFmt: fmt(valorTotal), incompletos,\n  porCategoria: pct(countBy('categoria')), porEstado: pct(countBy('estado')),\n  desde: fechas[0] ?? null, hasta: fechas[fechas.length - 1] ?? null,\n};\n// Lista completa de claves reales: sirve para descartar row_key inventados por el modelo.\nconst validKeys = rows.map((r) => r.row_key).filter(Boolean).map(String);\nconst filas = rows.slice(0, 150)\n  .map((r) => [r.row_key, r.fecha, r.cliente, r.categoria, r.valor, r.estado].join(' ; ')).join('\\n');\n\nconst prompt = `Eres un analista de datos. Recibes MÉTRICAS ya calculadas y una muestra de registros.\nTareas:\n1) \"resumen\": 2-3 frases en español para un directivo. Usa SOLO las cifras de MÉTRICAS. No calcules ni inventes cifras.\n2) \"inconsistencias\": máximo 10 registros sospechosos que las reglas simples NO detectan: nombres de cliente casi iguales (typos), categorías raras, valores muy atípicos respecto al resto del mismo cliente o categoría. Cita el row_key EXACTO de la muestra. Si no hay, devuelve [].\nResponde SOLO un JSON: {\"resumen\": string, \"inconsistencias\": [{\"row_key\": string, \"motivo\": string, \"severidad\": \"alta\"|\"media\"|\"baja\"}]}\n\nMÉTRICAS:\n${JSON.stringify(metrics)}\n\nMUESTRA (row_key ; fecha ; cliente ; categoria ; valor ; estado):\n${filas}`;\nreturn [{ json: { prompt, metrics, validKeys } }];\n"
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "r5",
+      "name": "Gemini: resumen e inconsistencias",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ contents: [{ parts: [{ text: $json.prompt }] }], generationConfig: { temperature: 0.2, maxOutputTokens: 4096, responseMimeType: 'application/json' } }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "Gemini API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "r6",
+      "name": "Parsear respuesta (con fallback)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Nodo: \"Parsear respuesta (con fallback)\" — valida el JSON de Gemini; si falla, usa una plantilla.\nconst MODEL = 'gemini-3.6-flash';\nconst prep = $('Preparar prompt').first().json;\nconst m = prep.metrics;\nconst validKeys = new Set((prep.validKeys ?? []).map(String));\nconst topEntry = (o) => Object.entries(o ?? {}).sort((a, b) => parseInt(b[1]) - parseInt(a[1]))[0] ?? ['-', '0 (0%)'];\nlet summary = null, flags = [], usedFallback = false, model = MODEL;\ntry {\n  if (!m || m.total === 0) throw new Error('sin registros');\n  const resp = $input.first()?.json ?? {};\n  model = resp.modelVersion || MODEL;\n  const parts = resp.candidates?.[0]?.content?.parts ?? [];\n  const text = parts.map((p) => p?.text ?? '').join('').trim();\n  const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());\n  if (typeof parsed.resumen !== 'string' || !parsed.resumen.trim()) throw new Error('sin resumen');\n  summary = parsed.resumen.trim();\n  const sev = new Set(['alta', 'media', 'baja']);\n  flags = (Array.isArray(parsed.inconsistencias) ? parsed.inconsistencias : [])\n    // Solo se aceptan row_key que existen de verdad: el modelo no puede inventarlos.\n    .filter((f) => f && validKeys.has(String(f.row_key)) && typeof f.motivo === 'string' && f.motivo.trim())\n    .map((f) => ({\n      row_key: String(f.row_key),\n      motivo: f.motivo.trim(),\n      severidad: sev.has(String(f.severidad ?? '').toLowerCase()) ? String(f.severidad).toLowerCase() : null,\n    }))\n    .slice(0, 10);\n} catch (e) {\n  usedFallback = true;\n  if (!m || m.total === 0) {\n    summary = 'No hay registros en el periodo para resumir.';\n  } else {\n    const [cat, catN] = topEntry(m.porCategoria);\n    summary = `Se procesaron ${m.total} registros por un valor total de ${m.valorTotalFmt}. ` +\n      `La categoría más frecuente es ${cat} (${catN}) y hay ${m.incompletos} registros con alertas de calidad.`;\n  }\n}\nreturn [{ json: {\n  period_from: m?.desde ?? null, period_to: m?.hasta ?? null,\n  total_records: m?.total ?? 0, valor_total: m?.valorTotal ?? 0,\n  summary, model: usedFallback ? 'plantilla' : model, used_fallback: usedFallback, flags,\n} }];\n"
+      }
+    },
+    {
+      "id": "r7",
+      "name": "Guardar resumen",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://ufrxxzrbakoaiqzzocds.supabase.co/rest/v1/ai_summaries",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpCustomAuth",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ period_from: $json.period_from, period_to: $json.period_to, total_records: $json.total_records, valor_total: $json.valor_total, summary: $json.summary, model: $json.model, used_fallback: $json.used_fallback }) }}"
+      },
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "",
+          "name": "Supabase service key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "r8",
+      "name": "Un item por inconsistencia",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Nodo: \"Un item por inconsistencia\"\nconst j = $input.first().json;\nreturn (j.flags ?? []).map((f) => ({ json: {\n  row_key: String(f.row_key), motivo: String(f.motivo), severidad: f.severidad ?? null, model: j.model } }));\n"
+      }
+    },
+    {
+      "id": "r9",
+      "name": "Guardar inconsistencias",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1560,
+        420
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://ufrxxzrbakoaiqzzocds.supabase.co/rest/v1/ai_flags?on_conflict=row_key,motivo",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpCustomAuth",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Prefer",
+              "value": "resolution=ignore-duplicates,return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}"
+      },
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "",
+          "name": "Supabase service key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Programado (diario)": {
+      "main": [
+        [
+          {
+            "node": "Leer registros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ejecutar manualmente": {
+      "main": [
+        [
+          {
+            "node": "Leer registros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer registros": {
+      "main": [
+        [
+          {
+            "node": "Preparar prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar prompt": {
+      "main": [
+        [
+          {
+            "node": "Gemini: resumen e inconsistencias",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: resumen e inconsistencias": {
+      "main": [
+        [
+          {
+            "node": "Parsear respuesta (con fallback)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parsear respuesta (con fallback)": {
+      "main": [
+        [
+          {
+            "node": "Guardar resumen",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Un item por inconsistencia",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Un item por inconsistencia": {
+      "main": [
+        [
+          {
+            "node": "Guardar inconsistencias",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

@@ -1,0 +1,170 @@
+[
+ {
+  "Fecha": "2026-10-01T00:00:00.000Z",
+  "Cliente": "Cliente A",
+  "Categoría": "Servicio A",
+  "Cantidad": 1,
+  "Valor": 1500,
+  "Estado": "Completado"
+ },
+ {
+  "Fecha": "2026-10-02T00:00:00.000Z",
+  "Cliente": "Cliente B",
+  "Categoría": "Servicio B",
+  "Cantidad": 2,
+  "Valor": 3000,
+  "Estado": "Pendiente"
+ },
+ {
+  "Fecha": "2026-10-03T00:00:00.000Z",
+  "Cliente": "Cliente C",
+  "Categoría": "Servicio C",
+  "Cantidad": 3,
+  "Valor": 4500,
+  "Estado": "Cancelado"
+ },
+ {
+  "Fecha": "2026-10-04T00:00:00.000Z",
+  "Cliente": "Cliente D",
+  "Categoría": "Servicio A",
+  "Cantidad": 4,
+  "Valor": 6000,
+  "Estado": "completado "
+ },
+ {
+  "Fecha": "2026-10-05T00:00:00.000Z",
+  "Cliente": "Cliente A",
+  "Categoría": "Servicio B",
+  "Cantidad": 5,
+  "Valor": 1500,
+  "Estado": "Pendiente"
+ },
+ {
+  "Fecha": "2026-10-06T00:00:00.000Z",
+  "Cliente": "Cliente B",
+  "Categoría": "Servicio C",
+  "Cantidad": 1,
+  "Valor": null,
+  "Estado": "Cancelado"
+ },
+ {
+  "Fecha": "2026-10-07T00:00:00.000Z",
+  "Cliente": "Cliente C",
+  "Categoría": "Servicio A",
+  "Cantidad": 2,
+  "Valor": 4500,
+  "Estado": "Completado"
+ },
+ {
+  "Fecha": "15/10/2026",
+  "Cliente": "Cliente D",
+  "Categoría": "Servicio B",
+  "Cantidad": 3,
+  "Valor": 6000,
+  "Estado": "Pendiente"
+ },
+ {
+  "Fecha": "2026-10-09T00:00:00.000Z",
+  "Cliente": "Cliente A",
+  "Categoría": "Servicio C",
+  "Cantidad": 4,
+  "Valor": 1500,
+  "Estado": "Cancelado"
+ },
+ {
+  "Fecha": "2026-10-10T00:00:00.000Z",
+  "Cliente": "Cliente B",
+  "Categoría": "Servicio A",
+  "Cantidad": 5,
+  "Valor": 3000,
+  "Estado": "Raro"
+ },
+ {
+  "Fecha": "2026-10-11T00:00:00.000Z",
+  "Cliente": "Cliente C",
+  "Categoría": "Servicio B",
+  "Cantidad": 1,
+  "Valor": 4500,
+  "Estado": "Pendiente"
+ },
+ {
+  "Fecha": "2026-10-12T00:00:00.000Z",
+  "Cliente": "Cliente D",
+  "Categoría": "Servicio C",
+  "Cantidad": 2,
+  "Valor": 9500000,
+  "Estado": "Cancelado"
+ },
+ {
+  "Fecha": "2026-10-13T00:00:00.000Z",
+  "Cliente": "Cliente A",
+  "Categoría": "Servicio A",
+  "Cantidad": 3,
+  "Valor": 1500,
+  "Estado": "Completado"
+ },
+ {
+  "Fecha": "2026-10-14T00:00:00.000Z",
+  "Cliente": "Cliente B",
+  "Categoría": "Servicio B",
+  "Cantidad": 4,
+  "Valor": 3000,
+  "Estado": "Pendiente"
+ },
+ {
+  "Fecha": "2026-10-15T00:00:00.000Z",
+  "Cliente": "Cliente C",
+  "Categoría": "Servicio C",
+  "Cantidad": 5,
+  "Valor": 4500,
+  "Estado": "Cancelado"
+ },
+ {
+  "Fecha": "2026-10-16T00:00:00.000Z",
+  "Cliente": "Cliente D",
+  "Categoría": "Servicio A",
+  "Cantidad": 1,
+  "Valor": 6000,
+  "Estado": "Completado"
+ },
+ {
+  "Fecha": "2026-10-17T00:00:00.000Z",
+  "Cliente": "Cliente A",
+  "Categoría": "Servicio B",
+  "Cantidad": 2,
+  "Valor": 1500,
+  "Estado": "Pendiente"
+ },
+ {
+  "Fecha": "2026-10-18T00:00:00.000Z",
+  "Cliente": "Cliente B",
+  "Categoría": "Servicio C",
+  "Cantidad": 3,
+  "Valor": 3000,
+  "Estado": "Cancelado"
+ },
+ {
+  "Fecha": "2026-10-19T00:00:00.000Z",
+  "Cliente": "Cliente C",
+  "Categoría": "Servicio A",
+  "Cantidad": 4,
+  "Valor": 4500,
+  "Estado": "Completado"
+ },
+ {
+  "Fecha": "2026-10-20T00:00:00.000Z",
+  "Cliente": "Cliente D",
+  "Categoría": "Servicio B",
+  "Cantidad": 5,
+  "Valor": 6000,
+  "Estado": "Pendiente"
+ },
+ {
+  "Fecha": "2026-10-01T00:00:00.000Z",
+  "Cliente": "Cliente A",
+  "Categoría": "Servicio A",
+  "Cantidad": 1,
+  "Valor": 1500,
+  "Estado": "Completado"
+ }
+]

@@ -1,0 +1,10 @@
+{
+  "name": "prueba-tecnica-ia-automatizacion",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/normalize.test.js tests/workflow2.test.js tests/workflows.test.js",
+    "build:workflows": "node scripts/build_workflows.js",
+    "check:workflows": "node scripts/build_workflows.js --check && node scripts/validate_workflows.js",
+    "seed": "node scripts/make_seed.js"
+  }
+}

@@ -1,0 +1,37 @@
+Reporte operativo semanal
+
+Fecha: 2026-10-26
+Cliente: Cliente A
+Número de referencia: REF-0001
+Categoría: Servicio A
+Valor: $1.500.000
+Estado: Completado
+
+Fecha: 2026-10-27
+Cliente: Cliente B
+Número de referencia: REF-0002
+Categoría: Servicio B
+Valor: $2.750.000
+Estado: Pendiente
+
+Fecha: 27 de octubre de 2026
+Cliente: Cliente C
+Número de referencia: REF-0003
+Categoría: Servicio A
+Valor: $980.000
+Estado: Completado
+
+Fecha: 2026-10-29
+Cliente: Cliente D
+Número de referencia: REF-0004
+Categoría: Servicio C
+Valor: $3.200.000
+Estado: Cancelado
+
+Fecha: 2026-10-30
+Cliente: Cliente A
+Número de referencia: REF-0005
+Categoría: Servicio B
+Valor: $1.100.500
+Estado: Completado
+
