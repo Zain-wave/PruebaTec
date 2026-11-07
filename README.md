@@ -183,8 +183,8 @@ El PDF de muestra se validó en local; antes de entregar conviene repetir la pru
 
 ## Demo y entrega
 - **Dashboard local:** `cd dashboard && npm install && npm run dev` → `http://localhost:3000`.
-- **Dashboard desplegado:** agregar aquí la URL de Vercel después del despliegue.
-- **Repositorio:** agregar aquí la URL de GitHub (público o privado con acceso al evaluador).
+- **Dashboard desplegado:** `https://dashboard-pied-rho-38.vercel.app/`.
+- **Repositorio:** `https://github.com/Zain-wave/PruebaTec/`.
 - **Checklist de entrega:** [`docs/ENTREGA.md`](docs/ENTREGA.md).
 - **Video sugerido (2-4 min):** mostrar el correo entrando, la ejecución de n8n, la fila nueva en Supabase y el dashboard
   actualizado; luego reenviar el mismo adjunto y mostrar que `records` no crece.
